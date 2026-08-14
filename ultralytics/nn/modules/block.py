@@ -1639,6 +1639,130 @@ class TorchVision(nn.Module):
         return y
 
 
+class DSTHA(nn.Module):
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        assert dim % num_heads == 0, f"d_model ({dim}) must be divisible by n_heads ({num_heads})"
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.sinkhorn_iters = 1
+        self.epsilon = 1e-6
+        self.all_head_dim = self.head_dim * num_heads
+
+        self.qkv = Conv(dim, self.all_head_dim * 3, 1, act=False)
+        self.proj = Conv(self.all_head_dim, dim, 1, act=False)
+        self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
+        # self.pe = Conv(self.all_head_dim, self.all_head_dim, 1, act=False)
+
+        self.delta_proj = nn.Linear(self.head_dim, 1)
+
+        init_alpha = 0.0
+        init_gamma = 1.0
+
+        self.alpha = nn.Parameter(torch.full((num_heads,), init_alpha))
+        self.gamma = nn.Parameter(torch.full((num_heads,), init_gamma))
+
+    def m(self) -> torch.Tensor:
+        return (1.0 - self.alpha).sqrt()
+
+    def phi(
+        self,
+        x: torch.Tensor,  # [batch, heads, seq, 2*d]
+        scale_b: torch.Tensor,  # [1, heads, 1, 1]
+        gamma: torch.Tensor,  # [1, heads, 1, 1]
+        m_b: torch.Tensor,  # [heads]
+    ) -> torch.Tensor:
+        d = x.shape[3]
+
+        shifted = x / (d**0.25) + m_b  # x_i / d^(1/4) + m
+        psi_raw = shifted * shifted
+
+        psi_sq_sum = (psi_raw * psi_raw).sum(dim=3, keepdim=True)
+        psi_norm = psi_sq_sum.sqrt() + 1e-6
+
+        delta = F.softplus(self.delta_proj(x), beta=0.1) + 1e-4  # [b, h, seq, 1]
+
+        psi = delta * psi_raw / psi_norm  # psi_hat(x), broadcasts over d
+
+        feat = torch.cat([psi, gamma], dim=3)
+
+        return feat * scale_b
+
+    def sinkhorn(self, phi_q: torch.Tensor, phi_k: torch.Tensor):
+        """
+        phi_q, phi_k: [batch, heads, seq, d_head + 1]
+        returns (u, w): each [batch, heads, seq, 1]
+        """
+        u = 1.0 / phi_q.norm(dim=3, keepdim=True)
+
+        phi_q_t = phi_q.transpose(2, 3)  # [batch, heads, d+1, seq]
+        phi_k_t = phi_k.transpose(2, 3)
+
+        for i in range(self.sinkhorn_iters):
+            qt_u = phi_q_t @ u  # [b,h,d+1,1]
+            w = 1.0 / (phi_k @ qt_u + self.epsilon)  # [b,h,seq,1]
+
+            kt_w = phi_k_t @ w  # [b,h,d+1,1]
+            u = 1.0 / (phi_q @ kt_w + self.epsilon)  # [b,h,seq,1]
+
+            mean_u = u.mean(dim=2, keepdim=True)
+            mean_w = w.mean(dim=2, keepdim=True)
+            g = (mean_w / mean_u).sqrt()
+            u = u * g
+            w = w / g
+
+        return u, w
+
+    def project_and_featurize(self, x: torch.Tensor):
+        B, _, H, W = x.shape
+        N = H * W
+        h, d = self.num_heads, self.head_dim
+
+        qkv = self.qkv(x).flatten(2).transpose(1, 2)
+        q, k, v = qkv.view(B, N, h, d * 3).permute(0, 2, 1, 3).split([d, d, d], dim=3)
+
+        m = self.m()  # [heads]
+        m_sq = m * m
+        alpha = 1.0 - m_sq
+        scale = (alpha.exp() / 2.0).sqrt()
+
+        scale_b = scale.view(1, h, 1, 1)
+        gamma_b = self.gamma.view(1, h, 1, 1)
+
+        m_b = m.view(1, h, 1, 1)
+
+        seq = q.shape[2]
+        gamma_term = gamma_b.expand(B, h, seq, 1)
+        phi_q = self.phi(q, scale_b, gamma_term, m_b)
+        phi_k = self.phi(k, scale_b, gamma_term, m_b)
+
+        return phi_q, phi_k, v
+
+    def apply_output(
+        self, phi_q: torch.Tensor, phi_k: torch.Tensor, v: torch.Tensor, height: int, width: int
+    ) -> torch.Tensor:
+        batch, h, _, d = v.shape
+
+        context = phi_k.transpose(2, 3) @ v  # [b,h,d+1,d_head]
+        out = phi_q @ context  # [b,h,seq,d_head]
+
+        out = out.permute(0, 1, 3, 2).reshape(batch, h * d, height, width)  # [B, all_head_dim, H, W]
+        v_spatial = v.permute(0, 1, 3, 2).reshape(batch, h * d, height, width)
+
+        return self.proj(out + self.pe(v_spatial))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _, _, H, W = x.shape
+        phi_q, phi_k, v = self.project_and_featurize(x)
+        u, w = self.sinkhorn(phi_q, phi_k)
+
+        phi_q_scaled = phi_q * u
+        phi_k_scaled = phi_k * w
+
+        return self.apply_output(phi_q_scaled, phi_k_scaled, v, H, W)
+
+
 class AAttn(nn.Module):
     """Area-attention module for YOLO models, providing efficient attention mechanisms.
 
@@ -1793,6 +1917,16 @@ class ABlock(nn.Module):
         return x + self.mlp(x)
 
 
+class DBlock(ABlock):
+    """Same as ABlock, but with DSTHA instead of AAttn. Reuses ABlock's __init__
+    (mlp, weight init) and only replaces the attention submodule."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 1.2, area: int = 1):
+        super().__init__(dim, num_heads, mlp_ratio, area)
+        self.attn = DSTHA(dim, num_heads=num_heads)
+        self.apply(self._init_weights)
+
+
 class A2C2f(nn.Module):
     """Area-Attention C2f module for enhanced feature extraction with area-based attention mechanisms.
 
@@ -1873,6 +2007,28 @@ class A2C2f(nn.Module):
         if self.gamma is not None:
             return x + self.gamma.view(-1, self.gamma.shape[0], 1, 1) * y
         return y
+
+
+class A2C2fDSTHA(A2C2f):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        a2: bool = True,
+        area: int = 1,
+        residual: bool = False,
+        mlp_ratio: float = 2.0,
+        e: float = 0.5,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        if a2:
+            c_ = int(c2 * e)
+            self.m = nn.ModuleList(
+                nn.Sequential(*(DBlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2))) for _ in range(n)
+            )
 
 
 class SwiGLUFFN(nn.Module):

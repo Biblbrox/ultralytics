@@ -1651,9 +1651,9 @@ class DSTHA(nn.Module):
         self.all_head_dim = self.head_dim * num_heads
 
         self.qkv = Conv(dim, self.all_head_dim * 3, 1, act=False)
-        self.proj = Conv(self.all_head_dim, dim, 1, act=False)
+
         self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
-        # self.pe = Conv(self.all_head_dim, self.all_head_dim, 1, act=False)
+        self.proj = Conv(self.all_head_dim, dim, 1, act=False)
 
         self.delta_proj = nn.Linear(self.head_dim, 1)
 
@@ -1668,7 +1668,7 @@ class DSTHA(nn.Module):
 
     def phi(
         self,
-        x: torch.Tensor,  # [batch, heads, seq, 2*d]
+        x: torch.Tensor,  # [batch, heads, seq, d]
         scale_b: torch.Tensor,  # [1, heads, 1, 1]
         gamma: torch.Tensor,  # [1, heads, 1, 1]
         m_b: torch.Tensor,  # [heads]
@@ -1699,7 +1699,7 @@ class DSTHA(nn.Module):
         phi_q_t = phi_q.transpose(2, 3)  # [batch, heads, d+1, seq]
         phi_k_t = phi_k.transpose(2, 3)
 
-        for i in range(self.sinkhorn_iters):
+        for _ in range(self.sinkhorn_iters):
             qt_u = phi_q_t @ u  # [b,h,d+1,1]
             w = 1.0 / (phi_k @ qt_u + self.epsilon)  # [b,h,seq,1]
 
@@ -1723,9 +1723,7 @@ class DSTHA(nn.Module):
         q, k, v = qkv.view(B, N, h, d * 3).permute(0, 2, 1, 3).split([d, d, d], dim=3)
 
         m = self.m()  # [heads]
-        m_sq = m * m
-        alpha = 1.0 - m_sq
-        scale = (alpha.exp() / 2.0).sqrt()
+        scale = (self.alpha.exp() / 2.0).sqrt()
 
         scale_b = scale.view(1, h, 1, 1)
         gamma_b = self.gamma.view(1, h, 1, 1)

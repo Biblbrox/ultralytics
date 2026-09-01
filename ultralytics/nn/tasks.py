@@ -29,6 +29,7 @@ from ultralytics.nn.modules import (
     SPPF,
     A2C2f,
     A2C2fDSTHA,
+    A2C2fQT,
     AConv,
     ADown,
     Bottleneck,
@@ -2008,6 +2009,7 @@ def parse_model(d, ch, verbose=True):
             C2fCIB,
             A2C2f,
             A2C2fDSTHA,
+            A2C2fQT,
         }
     )
     repeat_modules = frozenset(  # modules with 'repeat' arguments
@@ -2028,6 +2030,7 @@ def parse_model(d, ch, verbose=True):
             C2PSA,
             A2C2f,
             A2C2fDSTHA,
+            A2C2fQT,
         }
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
@@ -2067,6 +2070,10 @@ def parse_model(d, ch, verbose=True):
                 if scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))
             if m is A2C2fDSTHA:
+                legacy = False
+                if scale in "lx":  # for L/X sizes
+                    args.extend((True, 1.2))
+            if m is A2C2fQT:
                 legacy = False
                 if scale in "lx":  # for L/X sizes
                     args.extend((True, 1.2))

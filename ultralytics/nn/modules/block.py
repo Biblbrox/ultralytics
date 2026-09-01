@@ -1761,6 +1761,58 @@ class DSTHA(nn.Module):
         return self.apply_output(phi_q_scaled, phi_k_scaled, v, H, W)
 
 
+class QTAttn(nn.Module):
+    """Row-stochastic linear kernel attention (QT variant) ported from the CLIP_QTVit."""
+
+    def __init__(self, dim: int, num_heads: int):
+        super().__init__()
+        assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.all_head_dim = self.head_dim * num_heads
+        self.eps = 1e-15
+
+        self.qkv = Conv(dim, self.all_head_dim * 3, 1, act=False)
+        self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
+        self.proj = Conv(self.all_head_dim, dim, 1, act=False)
+
+        self.alpha = nn.Parameter(torch.ones(1))
+        self.delta_q = nn.Parameter(torch.ones(1))
+        self.delta_k = nn.Parameter(torch.ones(1))
+        self.ones_scale1 = nn.Parameter(torch.tensor(1.0))
+
+    def phi(self, x: torch.Tensor) -> torch.Tensor:
+        return (x + self.alpha) ** 2 * torch.exp(1 - self.alpha**2) * 0.5
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, _, H, W = x.shape
+        h, d = self.num_heads, self.head_dim
+
+        qkv = self.qkv(x).flatten(2).transpose(1, 2)
+        q, k, v = qkv.view(B, -1, h, d * 3).permute(0, 2, 1, 3).split([d, d, d], dim=3)
+
+        q = self.phi(q * (d**-0.5))
+        k = self.phi(k)
+        q_norm = q.norm(dim=-1, keepdim=True) + self.eps
+        k_norm = k.norm(dim=-1, keepdim=True) + self.eps
+        q = self.delta_q * q / (q_norm * k_norm)
+        k = self.delta_k * k / (q_norm * k_norm)
+
+        ones = torch.ones(B, h, q.shape[2], 1, device=x.device, dtype=x.dtype) * self.ones_scale1
+        q = torch.cat([q, ones], dim=-1)
+        k = torch.cat([k, ones], dim=-1)
+        v = torch.cat([v, torch.ones_like(v[..., :1])], dim=-1)
+
+        out = q @ (k.transpose(-1, -2) @ v)  # [B, h, N, d+1]
+        out = out[..., :-1] / (out[..., -1:] + self.eps)  # divide by the mass coordinate -> row-stochastic
+
+        out = out.permute(0, 1, 3, 2).reshape(B, h * d, H, W)
+        v_spatial = v[..., :d].permute(0, 1, 3, 2).reshape(B, h * d, H, W)
+
+        return self.proj(out + self.pe(v_spatial))
+
+
 class AAttn(nn.Module):
     """Area-attention module for YOLO models, providing efficient attention mechanisms.
 
@@ -2026,6 +2078,38 @@ class A2C2fDSTHA(A2C2f):
             c_ = int(c2 * e)
             self.m = nn.ModuleList(
                 nn.Sequential(*(DBlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2))) for _ in range(n)
+            )
+
+
+class QBlock(DBlock):
+    """Same as ABlock, but with QTAttn instead of AAttn. Reuses ABlock's __init__
+    (mlp, weight init) and only replaces the attention submodule."""
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 1.2, area: int = 1):
+        super().__init__(dim, num_heads, mlp_ratio, area)
+        self.attn = QTAttn(dim, num_heads=num_heads)
+        self.apply(self._init_weights)
+
+
+class A2C2fQT(A2C2f):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        a2: bool = True,
+        area: int = 1,
+        residual: bool = False,
+        mlp_ratio: float = 2.0,
+        e: float = 0.5,
+        g: int = 1,
+        shortcut: bool = True,
+    ):
+        super().__init__(c1, c2, n, a2, area, residual, mlp_ratio, e, g, shortcut)
+        if a2:
+            c_ = int(c2 * e)
+            self.m = nn.ModuleList(
+                nn.Sequential(*(QBlock(c_, c_ // 32, mlp_ratio, area) for _ in range(2))) for _ in range(n)
             )
 
 

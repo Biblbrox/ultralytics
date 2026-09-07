@@ -3,6 +3,9 @@
 
 from __future__ import annotations
 
+import math
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -1640,9 +1643,15 @@ class TorchVision(nn.Module):
 
 
 class DSTHA(nn.Module):
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, use_pe: bool = True, delta_mode: str = "value"):
         super().__init__()
         assert dim % num_heads == 0, f"d_model ({dim}) must be divisible by n_heads ({num_heads})"
+
+        # delta_mode selects where the per-token delta_proj modulation acts:
+        #   "phi"   (default, current behavior): scales the psi part of each phi row;
+        #   "value": gates the values v before context aggregation (v-gating).
+        # Both modes use the same delta_proj shape, so checkpoints are interchangeable.
+        self.delta_mode = delta_mode
 
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -1652,7 +1661,9 @@ class DSTHA(nn.Module):
 
         self.qkv = Conv(dim, self.all_head_dim * 3, 1, act=False)
 
-        self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
+        self.use_pe = use_pe
+        if use_pe:
+            self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
         self.proj = Conv(self.all_head_dim, dim, 1, act=False)
 
         self.delta_proj = nn.Linear(self.head_dim, 1)
@@ -1662,6 +1673,21 @@ class DSTHA(nn.Module):
 
         self.alpha = nn.Parameter(torch.full((num_heads,), init_alpha))
         self.gamma = nn.Parameter(torch.full((num_heads,), init_gamma))
+        self.sharpness = nn.Parameter(torch.zeros(num_heads))
+
+    def __setstate__(self, state):
+        params = state.get("_parameters", {})
+        if "sharpness" not in params:
+            n = state.get("num_heads")
+            if n is None and "alpha" in params:
+                n = params["alpha"].shape[0]
+            if n is not None:
+                params["sharpness"] = torch.zeros(n)
+        super().__setstate__(state)
+
+    @property
+    def _delta_mode(self) -> str:
+        return getattr(self, "delta_mode", "phi")
 
     def m(self) -> torch.Tensor:
         return (1.0 - self.alpha).sqrt()
@@ -1670,47 +1696,37 @@ class DSTHA(nn.Module):
         self,
         x: torch.Tensor,  # [batch, heads, seq, d]
         scale_b: torch.Tensor,  # [1, heads, 1, 1]
-        gamma: torch.Tensor,  # [1, heads, 1, 1]
         m_b: torch.Tensor,  # [heads]
+        p: torch.Tensor,
     ) -> torch.Tensor:
+        """psi_p(x) = normalize(s^p) * scale_b with s = (x/d^(1/4) + m)^2."""
         d = x.shape[3]
 
         shifted = x / (d**0.25) + m_b  # x_i / d^(1/4) + m
-        psi_raw = shifted * shifted
+        s = shifted * shifted
 
-        psi_sq_sum = (psi_raw * psi_raw).sum(dim=3, keepdim=True)
+        sp = torch.pow(s.clamp(min=1e-8), p)
+
+        psi_sq_sum = (sp * sp).sum(dim=3, keepdim=True)
         psi_norm = psi_sq_sum.sqrt() + 1e-6
 
-        delta = F.softplus(self.delta_proj(x), beta=0.1) + 1e-4  # [b, h, seq, 1]
+        psi = sp / psi_norm
 
-        psi = delta * psi_raw / psi_norm  # psi_hat(x), broadcasts over d
+        return psi * scale_b
 
-        feat = torch.cat([psi, gamma], dim=3)
-
-        return feat * scale_b
-
-    def sinkhorn(self, phi_q: torch.Tensor, phi_k: torch.Tensor):
+    def sinkhorn(self, phi_q: torch.Tensor, phi_k: torch.Tensor, scale_b: torch.Tensor):
         """
-        phi_q, phi_k: [batch, heads, seq, d_head + 1]
+        phi_q, phi_k: [batch, heads, seq, d_head]
         returns (u, w): each [batch, heads, seq, 1]
         """
-        u = 1.0 / phi_q.norm(dim=3, keepdim=True)
-
-        phi_q_t = phi_q.transpose(2, 3)  # [batch, heads, d+1, seq]
         phi_k_t = phi_k.transpose(2, 3)
 
-        for _ in range(self.sinkhorn_iters):
-            qt_u = phi_q_t @ u  # [b,h,d+1,1]
-            w = 1.0 / (phi_k @ qt_u + self.epsilon)  # [b,h,seq,1]
+        inv_scale = 1.0 / scale_b
+        qt_u = inv_scale * phi_q.sum(dim=2, keepdim=True).transpose(2, 3)
 
-            kt_w = phi_k_t @ w  # [b,h,d+1,1]
-            u = 1.0 / (phi_q @ kt_w + self.epsilon)  # [b,h,seq,1]
-
-            mean_u = u.mean(dim=2, keepdim=True)
-            mean_w = w.mean(dim=2, keepdim=True)
-            g = (mean_w / mean_u).sqrt()
-            u = u * g
-            w = w / g
+        w = 1.0 / (phi_k @ qt_u + self.epsilon)
+        kt_w = phi_k_t @ w
+        u = 1.0 / (phi_q @ kt_w + self.epsilon)
 
         return u, w
 
@@ -1726,34 +1742,36 @@ class DSTHA(nn.Module):
         scale = (self.alpha.exp() / 2.0).sqrt()
 
         scale_b = scale.view(1, h, 1, 1)
-        gamma_b = self.gamma.view(1, h, 1, 1)
-
         m_b = m.view(1, h, 1, 1)
 
-        seq = q.shape[2]
-        gamma_term = gamma_b.expand(B, h, seq, 1)
-        phi_q = self.phi(q, scale_b, gamma_term, m_b)
-        phi_k = self.phi(k, scale_b, gamma_term, m_b)
+        # Learnable per-head exponent (A1). The clamp keeps pow's exponent gradient
+        # finite for s -> 0 (relevant when p < 1); at init p == 1 exactly.
+        p = F.softplus(self.sharpness) / math.log(2.0)  # [heads]
+        p = p.view(1, self.num_heads, 1, 1)
 
-        return phi_q, phi_k, v
+        phi_q = self.phi(q, scale_b, m_b, p)
+        phi_k = self.phi(k, scale_b, m_b, p)
+
+        return phi_q, phi_k, v, scale_b
 
     def apply_output(
         self, phi_q: torch.Tensor, phi_k: torch.Tensor, v: torch.Tensor, height: int, width: int
     ) -> torch.Tensor:
         batch, h, _, d = v.shape
 
-        context = phi_k.transpose(2, 3) @ v  # [b,h,d+1,d_head]
+        context = phi_k.transpose(2, 3) @ v  # [b,h,d,d_head]
         out = phi_q @ context  # [b,h,seq,d_head]
 
         out = out.permute(0, 1, 3, 2).reshape(batch, h * d, height, width)  # [B, all_head_dim, H, W]
-        v_spatial = v.permute(0, 1, 3, 2).reshape(batch, h * d, height, width)
-
-        return self.proj(out + self.pe(v_spatial))
+        if self.use_pe:
+            v_spatial = v.permute(0, 1, 3, 2).reshape(batch, h * d, height, width)
+            return self.proj(out + self.pe(v_spatial))
+        return self.proj(out)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _, _, H, W = x.shape
-        phi_q, phi_k, v = self.project_and_featurize(x)
-        u, w = self.sinkhorn(phi_q, phi_k)
+        phi_q, phi_k, v, scale_b = self.project_and_featurize(x)
+        u, w = self.sinkhorn(phi_q, phi_k, scale_b)
 
         phi_q_scaled = phi_q * u
         phi_k_scaled = phi_k * w
@@ -1764,7 +1782,7 @@ class DSTHA(nn.Module):
 class QTAttn(nn.Module):
     """Row-stochastic linear kernel attention (QT variant) ported from the CLIP_QTVit."""
 
-    def __init__(self, dim: int, num_heads: int):
+    def __init__(self, dim: int, num_heads: int, use_pe: bool = True):
         super().__init__()
         assert dim % num_heads == 0, f"dim ({dim}) must be divisible by num_heads ({num_heads})"
 
@@ -1774,7 +1792,10 @@ class QTAttn(nn.Module):
         self.eps = 1e-15
 
         self.qkv = Conv(dim, self.all_head_dim * 3, 1, act=False)
-        self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
+        # Optional 7x7 depthwise positional-encoding conv (see DSTHA for rationale).
+        self.use_pe = use_pe
+        if use_pe:
+            self.pe = Conv(self.all_head_dim, self.all_head_dim, 7, 1, 3, g=self.all_head_dim, act=False)
         self.proj = Conv(self.all_head_dim, dim, 1, act=False)
 
         self.alpha = nn.Parameter(torch.ones(1))
@@ -1808,9 +1829,10 @@ class QTAttn(nn.Module):
         out = out[..., :-1] / (out[..., -1:] + self.eps)  # divide by the mass coordinate -> row-stochastic
 
         out = out.permute(0, 1, 3, 2).reshape(B, h * d, H, W)
-        v_spatial = v[..., :d].permute(0, 1, 3, 2).reshape(B, h * d, H, W)
-
-        return self.proj(out + self.pe(v_spatial))
+        if self.use_pe:
+            v_spatial = v[..., :d].permute(0, 1, 3, 2).reshape(B, h * d, H, W)
+            return self.proj(out + self.pe(v_spatial))
+        return self.proj(out)
 
 
 class AAttn(nn.Module):
@@ -1971,9 +1993,13 @@ class DBlock(ABlock):
     """Same as ABlock, but with DSTHA instead of AAttn. Reuses ABlock's __init__
     (mlp, weight init) and only replaces the attention submodule."""
 
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 1.2, area: int = 1):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 1.2, area: int = 1, delta_mode: str | None = None):
         super().__init__(dim, num_heads, mlp_ratio, area)
-        self.attn = DSTHA(dim, num_heads=num_heads)
+        if delta_mode is None:
+            # Env-var override so a value-gated model can be built from the stock yolo12-dstha.yaml
+            # without a config change; default (unset) preserves the original "phi" behavior.
+            delta_mode = os.environ.get("DSTHA_DELTA_MODE", "phi")
+        self.attn = DSTHA(dim, num_heads=num_heads, delta_mode=delta_mode)
         self.apply(self._init_weights)
 
 
